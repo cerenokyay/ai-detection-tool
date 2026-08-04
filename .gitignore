@@ -1,4 +1,6 @@
 echo ".venv/" >> .gitignore
 echo "__pycache__/" >> .gitignore
 echo "*.pyc" >> .gitignore
-echo ".DS_Store" >> .gitignore
+echo ".DS_Store" >> .gitignore*.onnx
+gpt2_onnx_model/
+.streamlit/

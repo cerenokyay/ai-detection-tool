@@ -1,20 +1,26 @@
 import numpy as np
+import joblib
 from optimum.onnxruntime import ORTModelForCausalLM
 from transformers import AutoTokenizer
 from typing import List, Dict, Any
 
 class TextMetricsAnalyzer:
-    def __init__(self, onnx_dir: str = "gpt2_onnx_model"):
+    def __init__(self, onnx_dir: str = "gpt2_onnx_model", clf_path: str = "ai_classifier.pkl"):
         """
-        Analiz motorunu HuggingFace Optimum ve ONNX Runtime ile başlatır.
+        HuggingFace Optimum ve Scikit-learn Classifier ile motoru başlatır.
         """
-        print(f"Metrics Analyzer (Optimum/ONNX) başlatılıyor...")
+        print("Metrics Analyzer (Optimum/ONNX + ML Classifier) başlatılıyor...")
         try:
+            # 1. NLP ve ONNX Modelleri
             self.tokenizer = AutoTokenizer.from_pretrained(onnx_dir)
             self.model = ORTModelForCausalLM.from_pretrained(onnx_dir)
-            print("ONNX Inference Engine Başarıyla Yüklendi.")
+            
+            # 2. Makine Öğrenmesi Sınıflandırıcısını (Logistic Regression) Yükle
+            self.classifier = joblib.load(clf_path)
+            
+            print("Tüm modeller başarıyla belleğe yüklendi.")
         except Exception as e:
-            raise RuntimeError(f"ONNX modeli yüklenemedi. Klasör eksik olabilir. Hata: {e}")
+            raise RuntimeError(f"Modeller yüklenirken hata oluştu. Klasörleri ve .pkl dosyasını kontrol edin. Hata: {e}")
 
     def calculate_perplexity(self, text: str) -> float:
         if not text.strip(): return 0.0
@@ -43,66 +49,32 @@ class TextMetricsAnalyzer:
         sentence_lengths = [len(sentence.split()) for sentence in sentences]
         return float(np.std(sentence_lengths))
 
-    # --- YENİ EKLENEN DİNAMİK ALGORİTMA ---
-    def calculate_ai_probability(self, perplexity: float, burstiness: float, word_count: int, sentence_count: int) -> dict:
-        """
-        Metin uzunluğuna göre dinamik eşikler belirler ve % üzerinden AI olasılığı hesaplar.
-        """
-        # 1. Dinamik Eşikleri Belirle
-        # Cümle sayısı azsa, beklenen burstiness düşüktür (Min: 5, Max: 20 olacak şekilde logaritmik/lineer artış)
-        dynamic_burstiness_threshold = min(20.0, 5.0 + (sentence_count * 0.6))
-        
-        # Kelime sayısı azsa, metin dar kapsamlıdır ve perplexity doğal olarak düşüktür.
-        # Kelime sayısı arttıkça beklenen perplexity eşiği yükselir.
-        dynamic_perplexity_threshold = max(35.0, 75.0 - (1000 / (word_count + 1)))
-
-        # 2. Skorlama Mantığı (0 = Kesin İnsan, 100 = Kesin Yapay Zeka)
-        # Perplexity Skoru (%60 Ağırlık)
-        if perplexity < (dynamic_perplexity_threshold * 0.5):
-            p_score = 100.0
-        elif perplexity > dynamic_perplexity_threshold:
-            p_score = 0.0
-        else:
-            # Eşikler arasında lineer bir yüzde hesapla
-            p_score = 100.0 - ((perplexity - (dynamic_perplexity_threshold * 0.5)) / (dynamic_perplexity_threshold * 0.5) * 100.0)
-
-        # Burstiness Skoru (%40 Ağırlık)
-        if burstiness < (dynamic_burstiness_threshold * 0.3):
-            b_score = 100.0
-        elif burstiness > dynamic_burstiness_threshold:
-            b_score = 0.0
-        else:
-            b_score = 100.0 - ((burstiness - (dynamic_burstiness_threshold * 0.3)) / (dynamic_burstiness_threshold * 0.7) * 100.0)
-
-        # Nihai Olasılığı Hesapla
-        ai_probability = (p_score * 0.6) + (b_score * 0.4)
-
-        return {
-            "ai_probability_percentage": round(ai_probability, 2),
-            "is_ai_generated": ai_probability > 50.0,
-            "dynamic_thresholds": {
-                "expected_min_perplexity_for_human": round(dynamic_perplexity_threshold, 2),
-                "expected_min_burstiness_for_human": round(dynamic_burstiness_threshold, 2)
-            }
-        }
-
     def analyze(self, nlp_result: Dict[str, Any]) -> Dict[str, Any]:
         text = nlp_result.get("cleaned_text", "")
         sentences = nlp_result.get("sentences", [])
-        word_count = nlp_result.get("word_count", 0)
-        sentence_count = nlp_result.get("sentence_count", 0)
 
+        # 1. Metrikleri hesapla (Feature Extraction)
         perplexity = self.calculate_perplexity(text)
         burstiness = self.calculate_burstiness(sentences)
 
-        # Yeni dinamik analiz motorunu çağırıyoruz
-        decision_data = self.calculate_ai_probability(perplexity, burstiness, word_count, sentence_count)
+        # 2. ML Modeline Ver (Inference)
+        # Sınıflandırıcıya iki boyutlu bir dizi (2D array) vermemiz gerekiyor
+        features = np.array([[perplexity, burstiness]])
+        
+        # predict_proba, [İnsan Olma Olasılığı, AI Olma Olasılığı] şeklinde bir dizi döner
+        probabilities = self.classifier.predict_proba(features)[0]
+        ai_probability_percentage = probabilities[1] * 100 # İkinci index (1) AI sınıfıdır
+        
+        # Kesin karar (Eğer AI olasılığı %50'den büyükse True)
+        is_ai = bool(self.classifier.predict(features)[0] == 1)
 
         return {
             "perplexity": round(perplexity, 2),
             "burstiness": round(burstiness, 2),
-            "ai_probability": f"%{decision_data['ai_probability_percentage']}",
-            "is_ai_generated_prediction": decision_data['is_ai_generated'],
-            "metrics_metadata": decision_data['dynamic_thresholds'],
-            "engine": "ONNX Runtime (via Optimum) with Dynamic Thresholds"
+            "ai_probability": f"%{round(ai_probability_percentage, 2)}",
+            "is_ai_generated_prediction": is_ai,
+            "metrics_metadata": {
+                "decision_model": "Logistic Regression Classifier"
+            },
+            "engine": "ONNX Runtime (via Optimum)"
         }
